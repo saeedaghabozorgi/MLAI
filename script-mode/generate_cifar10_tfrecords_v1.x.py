@@ -31,7 +31,7 @@ CIFAR_LOCAL_FOLDER = 'cifar-10-batches-py'
 
 def download_and_extract(data_dir):
   # download CIFAR-10 if not already downloaded.
-  #tf.contrib.learn.datasets.base.maybe_download(CIFAR_FILENAME, data_dir, CIFAR_DOWNLOAD_URL)
+  tf.contrib.learn.datasets.base.maybe_download(CIFAR_FILENAME, data_dir, CIFAR_DOWNLOAD_URL)
   tarfile.open(os.path.join(data_dir, CIFAR_FILENAME),
                'r:gz').extractall(data_dir)
 
