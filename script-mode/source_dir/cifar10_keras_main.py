@@ -340,7 +340,7 @@ if __name__ == '__main__':
         This is the inital learning rate value. The learning rate will decrease
         during training. For more details check the model_fn implementation in
         this file.\
-        """)
+        """) 
     parser.add_argument(
         '--epochs',
         type=int,
