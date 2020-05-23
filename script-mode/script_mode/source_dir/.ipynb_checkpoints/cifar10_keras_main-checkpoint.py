@@ -40,7 +40,7 @@ NUM_EXAMPLES_PER_EPOCH_FOR_TRAIN = 10000 * NUM_DATA_BATCHES
 INPUT_TENSOR_NAME = 'inputs_input'  # needs to match the name of the first layer + "_input"
 
 
-def keras_model_fn(learning_rate, weight_decay, optimizer, momentum, mpi=False, hvd=False):
+def keras_model_fn(learning_rate, weight_decay, optimizer, momentum):
     """keras_model_fn receives hyperparameters from the training job and returns a compiled keras model.
     The model will be transformed into a TensorFlow Estimator before training and it will be saved in a 
     TensorFlow Serving SavedModel at the end of training.
