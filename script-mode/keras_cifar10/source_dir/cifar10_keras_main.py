@@ -40,7 +40,7 @@ NUM_EXAMPLES_PER_EPOCH_FOR_TRAIN = 10000 * NUM_DATA_BATCHES
 INPUT_TENSOR_NAME = 'inputs_input'  # needs to match the name of the first layer + "_input"
 
 
-def keras_model_fn(learning_rate, weight_decay, optimizer, momentum):
+def keras_model_fn(learning_rate, weight_decay, optimizer, momentum, mpi=False, hvd=False):
     """keras_model_fn receives hyperparameters from the training job and returns a compiled keras model.
     The model will be transformed into a TensorFlow Estimator before training and it will be saved in a 
     TensorFlow Serving SavedModel at the end of training.
@@ -86,13 +86,18 @@ def keras_model_fn(learning_rate, weight_decay, optimizer, momentum):
     model.add(Activation('softmax'))
 
     size = 1
-    
+    if mpi:
+        size = hvd.size()
+
     if optimizer.lower() == 'sgd':
         opt = SGD(lr=learning_rate * size, decay=weight_decay, momentum=momentum)
     elif optimizer.lower() == 'rmsprop':
         opt = RMSprop(lr=learning_rate * size, decay=weight_decay)
     else:
         opt = Adam(lr=learning_rate * size, decay=weight_decay)
+
+    if mpi:
+        opt = hvd.DistributedOptimizer(opt)
 
     model.compile(loss='categorical_crossentropy',
                   optimizer=opt,
@@ -120,10 +125,20 @@ def validation_input_fn():
 
 
 def _input(epochs, batch_size, channel, channel_name):
+    mode = args.data_config[channel_name]['TrainingInputMode']
+    """Uses the tf.data input pipeline for CIFAR-10 dataset.
+    Args:
+        mode: Standard names for model modes (tf.estimators.ModeKeys).
+        batch_size: The number of samples per batch of input requested.
+    """
     filenames = get_filenames(channel_name, channel)
     # Repeat infinitely.
-    logging.info("Running {} ".format(channel_name))
-    dataset = tf.data.TFRecordDataset(filenames)
+    logging.info("Running {} in {} mode".format(channel_name, mode))
+    if mode == 'Pipe':
+        from sagemaker_tensorflow import PipeModeDataset
+        dataset = PipeModeDataset(channel=channel_name, record_format='TFRecord')
+    else:
+        dataset = tf.data.TFRecordDataset(filenames)
 
     dataset = dataset.repeat(epochs)
     dataset = dataset.prefetch(10)
@@ -199,22 +214,52 @@ def save_model(model, output):
 
 
 def main(args):
+    mpi = False
+    if 'sourcedir.tar.gz' in args.tensorboard_dir:
+        tensorboard_dir = re.sub('source/sourcedir.tar.gz', 'model', args.tensorboard_dir)
+    else:
+        tensorboard_dir = args.tensorboard_dir
+    logging.info("Writing TensorBoard logs to {}".format(tensorboard_dir))
+    if 'sagemaker_mpi_enabled' in args.fw_params:
+        if args.fw_params['sagemaker_mpi_enabled']:
+            import horovod.keras as hvd
+            mpi = True
+            # Horovod: initialize Horovod.
+            hvd.init()
+
+            # Horovod: pin GPU to be used to process local rank (one GPU per process)
+            config = tf.ConfigProto()
+            config.gpu_options.allow_growth = True
+            config.gpu_options.visible_device_list = str(hvd.local_rank())
+            K.set_session(tf.Session(config=config))
+    else:
+        hvd = None
+
+    logging.info("Running with MPI={}".format(mpi))
     logging.info("getting data")
     train_dataset = train_input_fn()
     eval_dataset = eval_input_fn()
     validation_dataset = validation_input_fn()
 
     logging.info("configuring model")
-    model = keras_model_fn(args.learning_rate, args.weight_decay, args.optimizer, args.momentum)
+    model = keras_model_fn(args.learning_rate, args.weight_decay, args.optimizer, args.momentum, mpi, hvd)
     callbacks = []
-
-    callbacks.append(keras.callbacks.ReduceLROnPlateau(patience=10, verbose=1))
-    callbacks.append(ModelCheckpoint(args.output_dir + '/checkpoint-{epoch}.h5'))
-
-    
+    if mpi:
+        callbacks.append(hvd.callbacks.BroadcastGlobalVariablesCallback(0))
+        callbacks.append(hvd.callbacks.MetricAverageCallback())
+        callbacks.append(hvd.callbacks.LearningRateWarmupCallback(warmup_epochs=5, verbose=1))
+        callbacks.append(keras.callbacks.ReduceLROnPlateau(patience=10, verbose=1))
+        if hvd.rank() == 0:
+            callbacks.append(ModelCheckpoint(args.output_dir + '/checkpoint-{epoch}.h5'))
+            callbacks.append(TensorBoard(log_dir=tensorboard_dir, update_freq='epoch'))
+    else:
+        callbacks.append(keras.callbacks.ReduceLROnPlateau(patience=10, verbose=1))
+        callbacks.append(ModelCheckpoint(args.output_dir + '/checkpoint-{epoch}.h5'))
+        callbacks.append(TensorBoard(log_dir=tensorboard_dir, update_freq='epoch'))
     logging.info("Starting training")
     size = 1
-    
+    if mpi:
+        size = hvd.size()
     model.fit(x=train_dataset[0], y=train_dataset[1],
               steps_per_epoch=(num_examples_per_epoch('train') // args.batch_size) // size,
               epochs=args.epochs, validation_data=validation_dataset,
@@ -226,8 +271,12 @@ def main(args):
     logging.info('Test loss:{}'.format(score[0]))
     logging.info('Test accuracy:{}'.format(score[1]))
 
-    
-    save_model(model, args.model_output_dir)
+    # Horovod: Save model only on worker 0 (i.e. master)
+    if mpi:
+        if hvd.rank() == 0:
+            save_model(model, args.model_output_dir)
+    else:
+        save_model(model, args.model_output_dir)
 
 
 def num_examples_per_epoch(subset='train'):
